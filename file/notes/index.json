@@ -1,7 +1,18 @@
 {
   "note-1792569672975": {
+    "x": -1322,
+    "y": 511,
+    "width": 818,
+    "height": 483,
+    "bg_color": "#fffcf2a8",
+    "border_color": "#ffd6c758",
+    "font_color": "#ff282418",
+    "font_size": 14,
+    "pinned": true
+  },
+  "note-1792678000461": {
     "x": 2172,
-    "y": 72,
+    "y": 96,
     "width": 340,
     "height": 300,
     "bg_color": "#fffcf8e3",

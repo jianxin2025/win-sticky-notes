@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import shutil
 import sys
@@ -53,6 +54,9 @@ APP_NAME = "便签"
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 VIDEO_EXTS = {".mp4", ".avi", ".mkv", ".mov", ".webm", ".wmv", ".flv", ".m4v"}
+
+_IMAGE_MD_RE = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
+_IMG_SRC_RE = re.compile(r'(<img[^>]*src=")([^"]+)(")')
 
 ACCENT = "#4c8dff"
 ACCENT_DIM = "#3a6fd8"
@@ -223,7 +227,7 @@ def render_markdown(text: str) -> tuple[str, list[str]]:
             return ""
         return match.group(0)
 
-    processed = re.sub(r"!\[[^\]]*\]\(([^)]+)\)", extract_video, text)
+    processed = _IMAGE_MD_RE.sub(extract_video, text)
     html = markdown.markdown(processed, extensions=["extra", "tables", "fenced_code", "sane_lists"])
     return html, video_paths
 
@@ -237,11 +241,26 @@ def fix_image_urls(html: str) -> str:
             src = QUrl.fromLocalFile(path).toString()
         return f"{prefix}{src}{suffix}"
 
-    return re.sub(r'(<img[^>]*src=")([^"]+)(")', repl, html)
+    return _IMG_SRC_RE.sub(repl, html)
 
 
 def clamp(value: int, lower: int, upper: int) -> int:
     return max(lower, min(value, upper))
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """原子写文本：先写同目录临时文件再 os.replace，避免写入中途崩溃损坏原文件。"""
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+
+
+def _first_line(content: str) -> str:
+    stripped = content.strip()
+    return stripped.splitlines()[0][:80] if stripped else ""
 
 
 class NoteStore:
@@ -268,13 +287,18 @@ class NoteStore:
         try:
             with open(self.config_path, "r", encoding="utf-8") as handle:
                 return json.load(handle)
-        except Exception:
+        except FileNotFoundError:
+            return {}
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"[NoteStore] 读取配置失败: {exc}", file=sys.stderr)
             return {}
 
     def save_config(self, notes_dir_value: str) -> None:
         self.file_root.mkdir(parents=True, exist_ok=True)
-        with open(self.config_path, "w", encoding="utf-8") as handle:
-            json.dump({"notes_dir": notes_dir_value}, handle, ensure_ascii=False, indent=2)
+        _atomic_write_text(
+            self.config_path,
+            json.dumps({"notes_dir": notes_dir_value}, ensure_ascii=False, indent=2),
+        )
 
     def config_notes_dir(self) -> str:
         return self._load_config().get("notes_dir", "file/notes")
@@ -286,37 +310,64 @@ class NoteStore:
         try:
             with open(self._index_path(), "r", encoding="utf-8") as handle:
                 return json.load(handle)
-        except Exception:
+        except FileNotFoundError:
+            return {}
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"[NoteStore] 读取索引失败: {exc}", file=sys.stderr)
             return {}
 
     def _save_index(self) -> None:
-        with open(self._index_path(), "w", encoding="utf-8") as handle:
-            json.dump(self.index, handle, ensure_ascii=False, indent=2)
+        _atomic_write_text(
+            self._index_path(),
+            json.dumps(self.index, ensure_ascii=False, indent=2),
+        )
 
     def new_id(self) -> str:
         return f"note-{int(time.time() * 1000)}"
 
-    def save_note(self, note_id: str, content: str, meta: dict) -> None:
-        with open(self.notes_dir / f"{note_id}.md", "w", encoding="utf-8") as handle:
-            handle.write(content)
-        self.index[note_id] = meta
+    def save_meta(self, note_id: str, meta: dict) -> None:
+        """仅更新元数据（位置/尺寸/样式等），不触碰 md 文件。"""
+        existing = self.index.get(note_id, {})
+        merged = {**existing, **meta}
+        if merged == existing:
+            return
+        self.index[note_id] = merged
+        self._save_index()
+
+    def save_content(self, note_id: str, content: str, meta: dict) -> None:
+        """保存内容到 md，并同步元数据与首行标题缓存。"""
+        _atomic_write_text(self.notes_dir / f"{note_id}.md", content)
+        merged = {**self.index.get(note_id, {}), **meta, "title": _first_line(content)}
+        self.index[note_id] = merged
         self._save_index()
 
     def load_note_content(self, note_id: str) -> str:
         try:
             with open(self.notes_dir / f"{note_id}.md", "r", encoding="utf-8") as handle:
                 return handle.read()
-        except Exception:
+        except FileNotFoundError:
+            return ""
+        except OSError as exc:
+            print(f"[NoteStore] 读取便签 {note_id} 失败: {exc}", file=sys.stderr)
             return ""
 
     def get_meta(self, note_id: str) -> dict:
         return self.index.get(note_id, {})
 
+    def note_title(self, note_id: str) -> str:
+        """优先用 index 中缓存的标题，缺失时回退读取 md 首行。"""
+        cached = self.index.get(note_id, {}).get("title")
+        if cached is not None:
+            return cached
+        return _first_line(self.load_note_content(note_id))
+
     def delete_note(self, note_id: str) -> None:
         try:
             (self.notes_dir / f"{note_id}.md").unlink()
-        except OSError:
+        except FileNotFoundError:
             pass
+        except OSError as exc:
+            print(f"[NoteStore] 删除便签 {note_id} 失败: {exc}", file=sys.stderr)
         shutil.rmtree(self.assets_dir / note_id, ignore_errors=True)
         self.index.pop(note_id, None)
         self._save_index()
@@ -534,6 +585,8 @@ class StickyNote(QWidget):
         self.preview_scroll.setWidget(self.preview_container)
         self.stack.addWidget(self.preview_scroll)
         self._video_blocks: list[VideoBlock] = []
+        self._preview_cache_source: str | None = None
+        self._preview_cache_html: str = ""
         root.addWidget(self.stack, 1)
 
         bottom = QHBoxLayout()
@@ -548,7 +601,8 @@ class StickyNote(QWidget):
         self.save_timer.setSingleShot(True)
         self.save_timer.setInterval(500)
         self.save_timer.timeout.connect(self.save_now)
-        self.editor.textChanged.connect(self.schedule_save)
+        self._content_dirty = False
+        self.editor.textChanged.connect(self._on_text_changed)
 
         self._stable_size = self.size()
         self._stable_pos = self.pos()
@@ -604,6 +658,9 @@ class StickyNote(QWidget):
         self.pin_button.setChecked(self.pinned)
         self.pin_button.blockSignals(blocked)
         self._apply_pin_flags()
+        # 恢复过程由 setPlainText/resize/move 误触发的保存需撤销
+        self._content_dirty = False
+        self.save_timer.stop()
 
     def _meta(self) -> dict:
         return {
@@ -618,15 +675,23 @@ class StickyNote(QWidget):
             "pinned": self.pinned,
         }
 
+    def _on_text_changed(self) -> None:
+        self._content_dirty = True
+        self.schedule_save()
+
     def schedule_save(self) -> None:
         self.save_timer.start()
 
     def save_now(self) -> None:
         self.save_timer.stop()
         try:
-            self.store.save_note(self.note_id, self.editor.toPlainText(), self._meta())
-        except Exception:
-            pass
+            if self._content_dirty:
+                self.store.save_content(self.note_id, self.editor.toPlainText(), self._meta())
+                self._content_dirty = False
+            else:
+                self.store.save_meta(self.note_id, self._meta())
+        except OSError as exc:
+            print(f"[StickyNote] 保存便签 {self.note_id} 失败: {exc}", file=sys.stderr)
 
     def toggle_view(self) -> None:
         if self._mode == "edit":
@@ -649,14 +714,21 @@ class StickyNote(QWidget):
         self.view_toggle.setText("编辑")
 
     def _render_preview(self) -> None:
-        html, video_paths = render_markdown(self.editor.toPlainText())
-        html = fix_image_urls(html)
-        self.preview_browser.setHtml(self._wrap_html(html))
-        self._clear_video_blocks()
-        for path in video_paths:
-            block = VideoBlock(path, self.preview_container)
-            self._video_blocks.append(block)
-            self.preview_layout.addWidget(block)
+        """源文本变化时重新解析并重建视频块；否则复用缓存。"""
+        source = self.editor.toPlainText()
+        if source != self._preview_cache_source:
+            html, video_paths = render_markdown(source)
+            self._preview_cache_html = fix_image_urls(html)
+            self._preview_cache_source = source
+            self.preview_browser.setHtml(self._wrap_html(self._preview_cache_html))
+            self._clear_video_blocks()
+            for path in video_paths:
+                block = VideoBlock(path, self.preview_container)
+                self._video_blocks.append(block)
+                self.preview_layout.addWidget(block)
+        else:
+            # 源未变（仅样式刷新）：只更新 HTML 样式，保留已有视频块
+            self.preview_browser.setHtml(self._wrap_html(self._preview_cache_html))
 
     def _clear_video_blocks(self) -> None:
         for block in self._video_blocks:
@@ -942,10 +1014,8 @@ class NoteListDialog(QDialog):
     def _refresh(self) -> None:
         self.list_widget.clear()
         for note_id in self.store.all_ids():
-            content = self.store.load_note_content(note_id)
-            stripped = content.strip()
-            first_line = stripped.splitlines()[0] if stripped else "(空便签)"
-            item = QListWidgetItem(f"{first_line[:48]}    [{note_id}]")
+            title = self.store.note_title(note_id) or "(空便签)"
+            item = QListWidgetItem(f"{title[:48]}    [{note_id}]")
             item.setData(Qt.ItemDataRole.UserRole, note_id)
             self.list_widget.addItem(item)
 

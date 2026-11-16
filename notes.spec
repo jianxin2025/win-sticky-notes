@@ -5,10 +5,6 @@ hiddenimports = [
     "markdown",
     "PySide6.QtMultimedia",
     "PySide6.QtMultimediaWidgets",
-    "win32com",
-    "win32com.client",
-    "pythoncom",
-    "pywintypes",
 ]
 
 
